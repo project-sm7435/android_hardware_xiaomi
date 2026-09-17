@@ -34,6 +34,7 @@
 
 #define LOG_TAG "libqtivibratoreffect.xiaomi"
 
+#include <aidl/android/hardware/vibrator/CompositePrimitive.h>
 #include <aidl/android/hardware/vibrator/Effect.h>
 #include <android-base/logging.h>
 #include <filesystem>
@@ -44,6 +45,7 @@
 
 #include "effect.h"
 
+using aidl::android::hardware::vibrator::CompositePrimitive;
 using aidl::android::hardware::vibrator::Effect;
 
 namespace {
@@ -69,7 +71,7 @@ std::unique_ptr<effect_stream> readEffectStreamFromFile(uint32_t uniqueEffectId)
 
     std::ifstream data(filePath, std::ios::in | std::ios::binary);
     if (!data.is_open()) {
-        LOG(ERROR) << "Failed to open " << filePath << " for effect " << effectId;
+        LOG(VERBOSE) << "Failed to open " << filePath << " for effect " << effectId;
         return nullptr;
     }
 
@@ -86,8 +88,12 @@ std::unique_ptr<effect_stream> readEffectStreamFromFile(uint32_t uniqueEffectId)
 
 std::unique_ptr<effect_stream> duplicateEffect(const effect_stream* effectStream,
                                                uint32_t newEffectId) {
+    if (!effectStream || effectStream->length == 0 || !effectStream->data) {
+        return nullptr;
+    }
+
     const std::uint32_t newEffectLength = effectStream->length * 4;
-    std::vector<int8_t> fifoData(newEffectLength);
+    std::vector<int8_t> fifoData(newEffectLength, 0);
 
     std::copy(effectStream->data, effectStream->data + effectStream->length, fifoData.begin());
     std::copy(effectStream->data, effectStream->data + effectStream->length,
@@ -103,27 +109,81 @@ std::unique_ptr<effect_stream> duplicateEffect(const effect_stream* effectStream
 
 const struct effect_stream* get_effect_stream(uint32_t effectId) {
     auto it = sEffectStreams.find(effectId);
-    if (it == sEffectStreams.end()) {
-        std::unique_ptr<effect_stream> newEffectStream = readEffectStreamFromFile(effectId);
+    if (it != sEffectStreams.end()) {
+        return &it->second;
+    }
 
+    if (effectId == static_cast<uint32_t>(Effect::DOUBLE_CLICK)) {
+        LOG(VERBOSE) << "Synthesizing double click effect from duplicated click";
+        std::unique_ptr<effect_stream> newEffectStream =
+                duplicateEffect(get_effect_stream(static_cast<uint32_t>(Effect::CLICK)),
+                                static_cast<uint32_t>(Effect::DOUBLE_CLICK));
         if (newEffectStream) {
             auto result = sEffectStreams.emplace(effectId, *newEffectStream);
             return &result.first->second;
-        } else if (effectId == (uint32_t)Effect::DOUBLE_CLICK) {
-            LOG(VERBOSE) << "Could not get double click effect, duplicating click effect";
-            newEffectStream = duplicateEffect(get_effect_stream((uint32_t)Effect::CLICK),
-                                              (uint32_t)Effect::DOUBLE_CLICK);
-            if (newEffectStream) {
-                auto result = sEffectStreams.emplace(effectId, *newEffectStream);
-                return &result.first->second;
-            }
-        } else if (effectId != (uint32_t)Effect::CLICK) {
-            LOG(VERBOSE) << "Could not get effect " << effectId << ", falling back to click effect";
-            return get_effect_stream((uint32_t)Effect::CLICK);
         }
-    } else {
-        return &it->second;
+    }
+
+    if ((effectId & kPrimitiveMask) != 0) {
+        uint32_t primitiveId = effectId & ~kPrimitiveMask;
+        const struct effect_stream* mappedStream = nullptr;
+
+        switch (static_cast<CompositePrimitive>(primitiveId)) {
+            case CompositePrimitive::LOW_TICK:
+            case CompositePrimitive::LIGHT_TICK:
+            case CompositePrimitive::SPIN:
+                mappedStream = get_effect_stream(static_cast<uint32_t>(Effect::TICK));
+                break;
+
+            case CompositePrimitive::THUD:
+                mappedStream = get_effect_stream(static_cast<uint32_t>(Effect::HEAVY_CLICK));
+                if (!mappedStream) {
+                    mappedStream = get_effect_stream(static_cast<uint32_t>(Effect::THUD));
+                }
+                break;
+
+            case CompositePrimitive::QUICK_RISE:
+            case CompositePrimitive::SLOW_RISE:
+            case CompositePrimitive::QUICK_FALL:
+                mappedStream = get_effect_stream(static_cast<uint32_t>(Effect::POP));
+                break;
+
+            case CompositePrimitive::CLICK:
+            case CompositePrimitive::NOOP:
+            default:
+                mappedStream = get_effect_stream(static_cast<uint32_t>(Effect::CLICK));
+                break;
+        }
+
+        if (mappedStream) {
+            auto result = sEffectStreams.emplace(effectId, *mappedStream);
+            return &result.first->second;
+        }
+    }
+
+    std::unique_ptr<effect_stream> newEffectStream = readEffectStreamFromFile(effectId);
+    if (newEffectStream) {
+        auto result = sEffectStreams.emplace(effectId, *newEffectStream);
+        return &result.first->second;
+    }
+
+    if (effectId == static_cast<uint32_t>(Effect::TEXTURE_TICK)) {
+        const struct effect_stream* tickStream = get_effect_stream(static_cast<uint32_t>(Effect::TICK));
+        if (tickStream) {
+            auto result = sEffectStreams.emplace(effectId, *tickStream);
+            return &result.first->second;
+        }
+    }
+
+    if (effectId != static_cast<uint32_t>(Effect::CLICK)) {
+        LOG(VERBOSE) << "Could not get effect " << effectId << ", falling back to click effect";
+        const struct effect_stream* clickStream = get_effect_stream(static_cast<uint32_t>(Effect::CLICK));
+        if (clickStream) {
+            auto result = sEffectStreams.emplace(effectId, *clickStream);
+            return &result.first->second;
+        }
     }
 
     return nullptr;
 }
+
